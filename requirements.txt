@@ -1,0 +1,4 @@
+# humanize-cn dependencies
+# 核心模块无外部依赖（纯 stdlib）
+# 以下为开发/测试依赖
+pytest>=7.0

@@ -1,0 +1,33 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量（含 API Key）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 测试 / 临时文件
+tmp/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
