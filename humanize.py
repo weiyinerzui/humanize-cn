@@ -33,6 +33,8 @@ sys.path.insert(0, SCRIPT_DIR)
 from detect  import detect as run_detect, get_level, score_sentences, format_report
 from rewrite import rewrite as run_rewrite
 from report  import generate_report, save_report
+from rewrite_beam import beam_rewrite
+from rewrite_polish import polish
 
 # ─── 工具函数 ───
 
@@ -70,10 +72,17 @@ def detect_and_print(text, label='检测结果', verbose=False):
 # ─── 主流程 ───
 
 def pipeline(text, mode='academic', intensity=None, model=None,
-             rounds=1, dry_run=False, verbose=False,
+             rounds=1, dry_run=False, verbose=False, detect_only=False,
+             beam_k=3, polish_enabled=True,
              input_path=None, output_dir=None):
     """
-    完整三阶段流水线
+    五阶段流水线 v2.0 — Adversarial Beam
+
+    Phase 1: detect (基线评分)
+    Phase 2: L3 beam search 改写
+    Phase 3: L1 rule-based 精修
+    Phase 4: detect (改写后评分)
+    Phase 5: report (对比报告)
 
     返回:
         dict: {
@@ -87,7 +96,7 @@ def pipeline(text, mode='academic', intensity=None, model=None,
             'output_report':    str | None,
         }
     """
-    print_banner('humanize-cn  降AI改写系统 v1.0')
+    print_banner('humanize-cn  降AI改写系统 v2.0')
 
     # ─── Phase 1: 检测 ───
     print_section('Phase 1  检测')
@@ -95,68 +104,47 @@ def pipeline(text, mode='academic', intensity=None, model=None,
     detect_before = detect_and_print(text, label='原文评分', verbose=verbose)
     print(f'  耗时: {time.time()-t0:.1f}s')
 
-    # 自动强度
-    auto_intensity = intensity
-    if auto_intensity is None:
-        auto_intensity = 'aggressive' if detect_before.final_score >= 60 else 'conservative'
-    print(f'  改写模式: {mode}  强度: {auto_intensity}')
+    if detect_only:
+        return {
+            'original': text,
+            'detect_before': detect_before,
+            'detect_after': None,
+            'rewritten': text,
+            'rewrite_result': {},
+            'report': {},
+            'output_rewritten': None,
+            'output_report': None,
+        }
 
     if detect_before.final_score < 20:
         print('  AI味较低，可能不需要改写。继续执行改写…')
 
-    # ─── Phase 2: 改写（支持多轮）───
-    print_section('Phase 2  改写')
-    current_text = text
-    rewrite_result = None
-    total_rounds = max(1, rounds)
-
-    for rnd in range(total_rounds):
-        if total_rounds > 1:
-            print(f'  第 {rnd+1}/{total_rounds} 轮…', end=' ', flush=True)
-        t1 = time.time()
-        rewrite_result = run_rewrite(
-            current_text,
-            mode=mode,
-            intensity=auto_intensity,
-            detect_result=detect_before,
-            model=model,
-            dry_run=dry_run,
-            verbose=verbose,
-        )
-        elapsed = time.time() - t1
-        if rewrite_result.get('error'):
-            print(f'改写失败: {rewrite_result["error"]}')
-            break
-        current_text = rewrite_result['rewritten']
-        if total_rounds > 1:
-            # 中间轮：检测一下
-            mid = run_detect(current_text)
-            print(f'改写后评分: {mid.final_score}  耗时: {elapsed:.1f}s')
-            if mid.final_score < 30:
-                print(f'  ✅ 评分已达目标，提前停止')
-                break
-        else:
-            print(f'  完成  模型: {rewrite_result["model"]}  耗时: {elapsed:.1f}s')
-
-    rewritten_text = current_text
-
-    # ─── Phase 3: 报告 ───
-    print_section('Phase 3  报告')
-    t2 = time.time()
-    report = generate_report(
-        text,
-        rewritten_text,
-        mode=mode,
-        intensity=auto_intensity,
-        model=rewrite_result['model'] if rewrite_result else 'unknown',
-        rewrite_error=rewrite_result.get('error') if rewrite_result else None,
-        title=os.path.basename(input_path) if input_path else None,
-    )
-
-    # 检测后文本
-    if not rewrite_result or rewrite_result.get('error'):
-        detect_after = None
+    # ─── Phase 2: L3 Beam Search 改写 ───
+    print_section(f'Phase 2  L3 Beam Search 改写 (K={beam_k})')
+    t1 = time.time()
+    rewrite_result = {}
+    if dry_run:
+        rewritten_text = text
+        rewrite_result = {'dry_run': True}
+        print('  [DRY RUN] 跳过 LLM 调用')
     else:
+        rewritten_text = beam_rewrite(text, mode=mode, k=beam_k,
+                                       model=model, verbose=verbose)
+        rewrite_result = {'model': model or 'deepseek/deepseek-v4-pro', 'error': None}
+    print(f'  Beam rewrite 完成  耗时: {time.time()-t1:.1f}s')
+
+    # ─── Phase 3: L1 精修 ───
+    if polish_enabled and not dry_run:
+        print_section('Phase 3  L1 精修')
+        t2 = time.time()
+        rewritten_text = polish(rewritten_text, mode=mode)
+        print(f'  精修完成  耗时: {time.time()-t2:.1f}s')
+    elif dry_run:
+        print_section('Phase 3  L1 精修 [DRY RUN 跳过]')
+
+    # ─── Phase 4: 改写后检测 ───
+    print_section('Phase 4  改写后检测')
+    if not dry_run:
         detect_after = run_detect(rewritten_text)
         score_after = detect_after.final_score
         score_before = detect_before.final_score
@@ -167,9 +155,23 @@ def pipeline(text, mode='academic', intensity=None, model=None,
         elif score_after < 50:
             print('  🟡 评分中等，建议提交朱雀验证后酌情再次改写')
         else:
-            print('  🟠 评分仍较高，建议用 --intensity aggressive --rounds 2 重试')
+            print('  🟠 评分仍较高，建议增加 --beam-k 或提交朱雀验证')
+    else:
+        detect_after = None
 
-    print(f'  报告生成耗时: {time.time()-t2:.1f}s')
+    # ─── Phase 5: 报告 ───
+    print_section('Phase 5  报告')
+    t3 = time.time()
+    report = generate_report(
+        text,
+        rewritten_text,
+        mode=mode,
+        intensity='beam',
+        model=rewrite_result.get('model', 'unknown') if rewrite_result else 'unknown',
+        rewrite_error=rewrite_result.get('error') if rewrite_result else None,
+        title=os.path.basename(input_path) if input_path else None,
+    )
+    print(f'  报告生成耗时: {time.time()-t3:.1f}s')
 
     # ─── 保存输出文件 ───
     output_rewritten = None
@@ -244,6 +246,10 @@ def main():
     parser.add_argument('--model', help='LLM 模型（默认 .env/CF_MODEL）')
     parser.add_argument('--rounds', type=int, default=1,
                         help='改写轮数（默认1，最多3）')
+    parser.add_argument('--beam-k', type=int, default=3,
+                        help='Beam width: 每句候选改写数（默认3）')
+    parser.add_argument('--no-polish', action='store_true',
+                        help='跳过 L1 精修阶段')
     parser.add_argument('--output-dir', help='输出目录（默认与输入文件同目录）')
     parser.add_argument('--detect-only', action='store_true',
                         help='只运行检测，不改写')
@@ -282,6 +288,8 @@ def main():
         intensity=args.intensity,
         model=args.model,
         rounds=rounds,
+        beam_k=args.beam_k,
+        polish_enabled=not args.no_polish,
         dry_run=args.dry_run,
         verbose=args.verbose,
         input_path=input_path,

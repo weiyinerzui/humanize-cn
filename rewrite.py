@@ -19,7 +19,7 @@ _load_env()
 
 # ─── 默认配置 · 七牛云 QnAIGC ───
 QN_BASE_URL = os.environ.get('QN_BASE_URL', 'https://api.qnaigc.com/v1')
-QN_API_KEY  = os.environ.get('QN_API_KEY', '') or os.environ.get('QNAIGC_API_TOKEN', '')
+QN_API_KEY = os.environ.get('QN_API_KEY', '') or os.environ.get('QNAIGC_API_TOKEN', '')
 QN_MODEL    = os.environ.get('QN_MODEL', '') or os.environ.get('MODEL_ID', 'deepseek/deepseek-v4-pro')
 
 PROMPTS = {}
