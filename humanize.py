@@ -73,7 +73,7 @@ def detect_and_print(text, label='检测结果', verbose=False):
 
 def pipeline(text, mode='academic', intensity=None, model=None,
              rounds=1, dry_run=False, verbose=False, detect_only=False,
-             beam_k=3, polish_enabled=True,
+             beam_k=5, polish_enabled=True,
              input_path=None, output_dir=None):
     """
     五阶段流水线 v2.0 — Adversarial Beam
@@ -119,45 +119,69 @@ def pipeline(text, mode='academic', intensity=None, model=None,
     if detect_before.final_score < 20:
         print('  AI味较低，可能不需要改写。继续执行改写…')
 
-    # ─── Phase 2: L3 Beam Search 改写 ───
-    print_section(f'Phase 2  L3 Beam Search 改写 (K={beam_k})')
-    t1 = time.time()
-    rewrite_result = {}
-    if dry_run:
-        rewritten_text = text
-        rewrite_result = {'dry_run': True}
-        print('  [DRY RUN] 跳过 LLM 调用')
-    else:
-        rewritten_text = beam_rewrite(text, mode=mode, k=beam_k,
-                                       model=model, verbose=verbose)
-        rewrite_result = {'model': model or 'deepseek/deepseek-v4-pro', 'error': None}
-    print(f'  Beam rewrite 完成  耗时: {time.time()-t1:.1f}s')
+    # ─── Multi-round Pipeline ───
+    current_text = text
+    current_detect = detect_before
+    
+    for r in range(rounds):
+        if rounds > 1:
+            print_section(f'Round {r+1}/{rounds}')
+            
+        # Extract top issues from current detection to use as feedback
+        top_issues = []
+        if current_detect and current_detect.issues:
+            from collections import defaultdict
+            by_cat = defaultdict(int)
+            for iss in current_detect.issues:
+                by_cat[iss['category']] += 1
+            top_issues = [cat for cat, _ in sorted(by_cat.items(), key=lambda x: -x[1])[:3]]
 
-    # ─── Phase 3: L1 精修 ───
-    if polish_enabled and not dry_run:
-        print_section('Phase 3  L1 精修')
-        t2 = time.time()
-        rewritten_text = polish(rewritten_text, mode=mode)
-        print(f'  精修完成  耗时: {time.time()-t2:.1f}s')
-    elif dry_run:
-        print_section('Phase 3  L1 精修 [DRY RUN 跳过]')
-
-    # ─── Phase 4: 改写后检测 ───
-    print_section('Phase 4  改写后检测')
-    if not dry_run:
-        detect_after = run_detect(rewritten_text)
-        score_after = detect_after.final_score
-        score_before = detect_before.final_score
-        delta = score_before - score_after
-        print(f'  原文: {score_before}/100  →  改写: {score_after}/100  (变化: {"-" if delta>=0 else "+"}{abs(delta)}分)')
-        if score_after < 30:
-            print('  ✅ 评分低于30，有较大概率通过AIGC检测')
-        elif score_after < 50:
-            print('  🟡 评分中等，建议提交朱雀验证后酌情再次改写')
+        # Phase 2: L3 Beam Search
+        print_section(f'Phase 2  L3 Beam Search 改写 (K={beam_k})')
+        t1 = time.time()
+        if dry_run:
+            rewritten_text = current_text
+            rewrite_result = {'dry_run': True}
+            print('  [DRY RUN] 跳过 LLM 调用')
         else:
-            print('  🟠 评分仍较高，建议增加 --beam-k 或提交朱雀验证')
-    else:
-        detect_after = None
+            rewritten_text = beam_rewrite(current_text, mode=mode, k=beam_k,
+                                           model=model, verbose=verbose,
+                                           feedback_issues=top_issues)
+            rewrite_result = {'model': model or 'deepseek/deepseek-v4-pro', 'error': None}
+        print(f'  Beam rewrite 完成  耗时: {time.time()-t1:.1f}s')
+
+        # Phase 2.5: 统计特征优化
+        print_section('Phase 2.5  统计特征优化 (困惑度/爆发度校正)')
+        from engine.stat_optimizer import run_statistical_optimization
+        rewritten_text = run_statistical_optimization(rewritten_text)
+
+        # Phase 3: L1 精修
+        if polish_enabled and not dry_run:
+            print_section('Phase 3  L1 精修')
+            t2 = time.time()
+            rewritten_text = polish(rewritten_text, mode=mode)
+            print(f'  精修完成  耗时: {time.time()-t2:.1f}s')
+        elif dry_run:
+            print_section('Phase 3  L1 精修 [DRY RUN 跳过]')
+
+        # Phase 4: 改写后检测
+        print_section('Phase 4  改写后检测')
+        if not dry_run:
+            detect_after = run_detect(rewritten_text)
+            score_after = detect_after.final_score
+            score_before = current_detect.final_score
+            delta = score_before - score_after
+            print(f'  本轮前: {score_before}/100  →  本轮后: {score_after}/100  (变化: {"-" if delta>=0 else "+"}{abs(delta)}分)')
+            
+            if score_after < 30:
+                print('  ✅ 评分低于30，非常安全，提前结束改写。')
+                break
+                
+            current_text = rewritten_text
+            current_detect = detect_after
+        else:
+            detect_after = None
+            break
 
     # ─── Phase 5: 报告 ───
     print_section('Phase 5  报告')
@@ -246,8 +270,8 @@ def main():
     parser.add_argument('--model', help='LLM 模型（默认 .env/CF_MODEL）')
     parser.add_argument('--rounds', type=int, default=1,
                         help='改写轮数（默认1，最多3）')
-    parser.add_argument('--beam-k', type=int, default=3,
-                        help='Beam width: 每句候选改写数（默认3）')
+    parser.add_argument('--beam-k', type=int, default=5,
+                        help='Beam width: 每句候选改写数（默认5）')
     parser.add_argument('--no-polish', action='store_true',
                         help='跳过 L1 精修阶段')
     parser.add_argument('--output-dir', help='输出目录（默认与输入文件同目录）')

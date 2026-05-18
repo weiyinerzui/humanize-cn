@@ -43,10 +43,13 @@ def get_intensity(score):
 
 # ─── LLM 调用（OpenAI 兼容格式）───
 
-def call_llm(system_prompt, user_text, model=None, max_tokens=4096, timeout=120):
-    model = model or QN_MODEL
+def call_llm(system_prompt, user_text, model=None, max_tokens=1500, timeout=60, temperature=0.85):
+    """调用大模型 API (DeepSeek/Qwen 兼容)"""
+    _load_env()
+    
     api_key = QN_API_KEY
     base_url = QN_BASE_URL
+    model = model or QN_MODEL
 
     if not api_key:
         return None, 'QN_API_KEY 未设置。请在 humanize-cn/.env 中配置。'
@@ -59,7 +62,7 @@ def call_llm(system_prompt, user_text, model=None, max_tokens=4096, timeout=120)
             {'role': 'user',   'content': user_text},
         ],
         'max_tokens': max_tokens,
-        'temperature': 0.85,
+        'temperature': temperature,
         'top_p':       0.9,
     }
     data = json.dumps(payload).encode('utf-8')

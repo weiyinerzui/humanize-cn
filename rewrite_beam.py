@@ -19,6 +19,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from text_utils import split_sentences, merge_sentences
 from rewrite import call_llm, call_with_retry, _clean_llm_output
+from metrics.semantic_sim import compute_semantic_similarity
 
 
 # ─── Candidate Generation Prompts ───
@@ -77,22 +78,31 @@ BEAM_PROMPTS = {
 }
 
 
-def generate_candidates(sentence: str, mode: str = 'academic', k: int = 3,
-                         model: str = None) -> list[str]:
+def generate_candidates(sentence: str, mode: str = 'academic', k: int = 5,
+                         model: str = None, feedback_issues: list = None) -> list[str]:
     """Generate K diverse candidate rewrites for a sentence.
 
-    Uses different prompt variants to produce diversity.
+    Uses different prompt variants and temperature settings to produce diversity.
     Falls back gracefully on LLM errors.
     """
     prompts = BEAM_PROMPTS.get(mode, BEAM_PROMPTS['academic'])
-    selected_prompts = [prompts[i % len(prompts)] for i in range(k)]
-
+    
+    # Temperature schedule for diversity
+    temps = [0.7, 0.7, 1.0, 1.0, 1.2]
+    
     candidates = []
-    for prompt_template in selected_prompts:
+    for i in range(k):
+        prompt_template = prompts[i % len(prompts)]
+        temp = temps[i % len(temps)]
+        
         prompt = prompt_template.format(text=sentence)
+        if feedback_issues:
+            feedback_str = "、".join(feedback_issues)
+            prompt += f"\n\n[注意] 上次检测发现您的文本具有以下明显的 AI 特征：{feedback_str}。请在本次改写中彻底避免这些特征，打破固定句式！"
+
         rewritten, err = call_with_retry(
             "你是文本改写助手。直接输出改写结果，不要加前缀说明。",
-            prompt, model=model, retries=2, delay=3
+            prompt, model=model, retries=2, delay=3, temperature=temp
         )
         if err:
             candidates.append(sentence)  # fallback to original
@@ -115,13 +125,14 @@ def select_best(candidates: list[str], detect_scores: list[float]) -> str:
     return paired[0][0]
 
 
-def score_candidates(candidates: list[str]) -> list[float]:
-    """Score each candidate using detect.py. Lower score = less AI-like."""
+def score_candidates(candidates: list[str], prev_sent: str = "", next_sent: str = "") -> list[float]:
+    """Score each candidate using detect.py with context awareness. Lower score = less AI-like."""
     from detect import detect as run_detect
     scores = []
     for c in candidates:
         try:
-            result = run_detect(c)
+            context = prev_sent + c + next_sent
+            result = run_detect(context)
             scores.append(result.final_score)
         except Exception:
             scores.append(100)  # worst score as fallback
@@ -129,16 +140,16 @@ def score_candidates(candidates: list[str]) -> list[float]:
 
 
 def beam_rewrite_sentence(sentence: str, mode: str = 'academic',
-                          k: int = 3, model: str = None) -> list[str]:
+                          k: int = 5, model: str = None, feedback_issues: list = None) -> list[str]:
     """Beam rewrite a single sentence: generate K candidates.
 
     Returns all candidates (caller picks best via select_best).
     """
-    return generate_candidates(sentence, mode=mode, k=k, model=model)
+    return generate_candidates(sentence, mode=mode, k=k, model=model, feedback_issues=feedback_issues)
 
 
-def beam_rewrite(text: str, mode: str = 'academic', k: int = 3,
-                 model: str = None, verbose: bool = False) -> str:
+def beam_rewrite(text: str, mode: str = 'academic', k: int = 5,
+                 model: str = None, verbose: bool = False, feedback_issues: list = None) -> str:
     """Full beam rewrite: split text into sentences, beam rewrite each.
 
     Args:
@@ -163,20 +174,35 @@ def beam_rewrite(text: str, mode: str = 'academic', k: int = 3,
         if verbose:
             print(f'[beam] sentence {i+1}/{total}: {sent[:40]}...', file=sys.stderr)
 
+        # Context window
+        prev_sent = rewritten_sentences[-1] if len(rewritten_sentences) > 0 else ""
+        next_sent = sentences[i+1] if i < total - 1 else ""
+
         # Skip very short sentences (noise, terminators)
         if len(sent.strip()) < 4:
             rewritten_sentences.append(sent)
             continue
 
         # Generate candidates and score
-        candidates = beam_rewrite_sentence(sent, mode=mode, k=k, model=model)
+        candidates = beam_rewrite_sentence(sent, mode=mode, k=k, model=model, feedback_issues=feedback_issues)
 
         if len(candidates) <= 1:
             rewritten_sentences.append(candidates[0] if candidates else sent)
             continue
 
-        scores = score_candidates(candidates)
-        best = select_best(candidates, scores)
+        valid_candidates = []
+        for c in candidates:
+            sim = compute_semantic_similarity(sent, c)
+            if sim >= 0.60:
+                valid_candidates.append(c)
+            elif verbose:
+                print(f'  [reject] sim={sim:.4f} for: {c[:20]}...', file=sys.stderr)
+
+        if not valid_candidates:
+            valid_candidates = [sent]
+
+        scores = score_candidates(valid_candidates, prev_sent=prev_sent, next_sent=next_sent)
+        best = select_best(valid_candidates, scores)
         rewritten_sentences.append(best)
 
         if verbose:
